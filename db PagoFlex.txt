@@ -1,0 +1,154 @@
+-- ============ EMPRESAS (clientes de PagoFlex) ============
+CREATE TABLE empresas (
+    id            SERIAL PRIMARY KEY,
+    nombre        VARCHAR(120) NOT NULL,
+    rubro         VARCHAR(60)  NOT NULL,          -- inmobiliario, credito, educacion, seguros, ong
+    logo_url      VARCHAR(255),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ USUARIOS FINALES ============
+CREATE TABLE usuarios (
+    id            BIGSERIAL PRIMARY KEY,
+    external_ref  VARCHAR(64) UNIQUE NOT NULL,     -- id anónimo proveniente del portal/agente
+    nombre        VARCHAR(120) NOT NULL,
+    email_hash    VARCHAR(255),                    -- no se guarda el email plano
+    phone_hash    VARCHAR(255),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_active     BOOLEAN NOT NULL DEFAULT true
+);
+
+-- ============ COMPROMISOS DE PAGO ============
+CREATE TABLE compromisos (
+    id                BIGSERIAL PRIMARY KEY,
+    usuario_id        BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    empresa_id        INT  NOT NULL REFERENCES empresas(id)  ON DELETE CASCADE,
+    codigo            VARCHAR(40) NOT NULL,               -- "AR-2026-00123"
+    monto             NUMERIC(12,2) NOT NULL CHECK (monto > 0),
+    moneda            CHAR(3) NOT NULL DEFAULT 'CLP',
+    fecha_vencimiento DATE NOT NULL,
+    frecuencia        VARCHAR(20) NOT NULL DEFAULT 'mensual',
+    estado            VARCHAR(20) NOT NULL DEFAULT 'vigente'
+        CHECK (estado IN ('vigente','pagado',' vencido','en_gestiones','anulado')),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (usuario_id, empresa_id, codigo)
+);
+CREATE INDEX idx_compromisos_usuario_venc ON compromisos (usuario_id, fecha_vencimiento);
+CREATE INDEX idx_compromisos_estado       ON compromisos (estado);
+
+-- ============ HISTORIAL DE PAGOS ============
+CREATE TABLE pagos (
+    id             BIGSERIAL PRIMARY KEY,
+    compromiso_id  BIGINT NOT NULL REFERENCES compromisos(id) ON DELETE CASCADE,
+    monto_pagado   NUMERIC(12,2) NOT NULL CHECK (monto_pagado >= 0),
+    fecha_pago     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    metodo         VARCHAR(40) NOT NULL,           -- transferencia, tarjeta, cash, link
+    status         VARCHAR(20) NOT NULL DEFAULT 'confirmado'
+        CHECK (status IN ('confirmado','pendiente','fallido','reembolsado')),
+    referencia_ext VARCHAR(64)
+);
+CREATE INDEX idx_pagos_compromiso ON pagos (compromiso_id);
+
+-- ============ INDICADOR DE COMPORTAMIENTO (cumplimiento histórico) ============
+CREATE TABLE metricas_comportamiento (
+    usuario_id        BIGINT PRIMARY KEY REFERENCES usuarios(id) ON DELETE CASCADE,
+    puntualidad_pct   NUMERIC(5,2) NOT NULL DEFAULT 0,   -- % de pagos a tiempo
+    pagos_retrasados  INT NOT NULL DEFAULT 0,
+    racha_actual      INT NOT NULL DEFAULT 0,            -- meses consecutivos al día
+    score             INT  NOT NULL DEFAULT 0,           -- 0..100, usado en gamificación
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ GAMIFICACIÓN ============
+CREATE TABLE logros (
+    id     SERIAL PRIMARY KEY,
+    codigo VARCHAR(40) UNIQUE NOT NULL,     -- 'RACHA_6', 'Puntual_100'
+    nombre VARCHAR(120) NOT NULL,
+    descripcion VARCHAR(255)
+);
+
+CREATE TABLE usuario_logros (
+    usuario_id BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    logro_id   INT  NOT NULL REFERENCES logros(id) ON DELETE CASCADE,
+    obtenido_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (usuario_id, logro_id)
+);
+
+-- ============ REFERIDOS (adopción orgánica) ============
+CREATE TABLE referidos (
+    id            BIGSERIAL PRIMARY KEY,
+    usuario_id    BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    empresa_invitada VARCHAR(120) NOT NULL,
+    estado        VARCHAR(20) NOT NULL DEFAULT 'invitado'
+        CHECK (estado IN ('invitado','aceptado','activo','rechazado')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============ RECORDATORIOS / NOTIFICACIONES PUSH ============
+CREATE TABLE dispositivos (
+    id           BIGSERIAL PRIMARY KEY,
+    usuario_id   BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    push_token   VARCHAR(255) NOT NULL,
+    platform     VARCHAR(20) NOT NULL DEFAULT 'android',
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE notificaciones (
+    id            BIGSERIAL PRIMARY KEY,
+    usuario_id    BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    compromiso_id BIGINT REFERENCES compromisos(id) ON DELETE CASCADE,
+    tipo          VARCHAR(30) NOT NULL,             -- vencimiento, pago_confirmado, logro, referido
+    titulo        VARCHAR(140) NOT NULL,
+    cuerpo        TEXT,
+    send_at       TIMESTAMPTZ NOT NULL,
+    sent          BOOLEAN NOT NULL DEFAULT false,
+    read_at       TIMESTAMPTZ
+);
+CREATE INDEX idx_notif_usuario ON notificaciones (usuario_id, send_at DESC);
+
+-- ============ EVENTOS DE USO (para medir hábito / profundidad) ============
+CREATE TABLE eventos_interaccion (
+    id         BIGSERIAL PRIMARY KEY,
+    usuario_id BIGINT NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+    tipo       VARCHAR(40) NOT NULL,               -- apertura, pago, view_historial, compartir
+    payload    JSONB,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_eventos_usuario_time ON eventos_interaccion (usuario_id, occurred_at);
+
+
+--------------------------------------------------------
+--tu situación de pagos
+--------------------------------------------------------
+CREATE VIEW vw_situacion_usuario AS
+SELECT u.id AS usuario_id,
+       e.nombre AS empresa,
+       c.codigo,
+       c.monto,
+       c.fecha_vencimiento,
+       c.estado,
+       (c.fecha_vencimiento - CURRENT_DATE) AS dias_restantes,
+       m.puntualidad_pct
+FROM usuarios u
+JOIN compromisos c ON c.usuario_id = u.id
+JOIN empresas e    ON e.id = c.empresa_id
+JOIN metricas_comportamiento m ON m.usuario_id = u.id;
+
+
+---------------------------------------------------
+
+INSERT INTO empresas (nombre, rubro) VALUES
+ ('Vertika Properties','inmobiliario'),
+ ('Credicelio','credito'),
+ ('Instituto Bello','educacion'),
+ ('SegurNova','seguros'),
+ ('Fundacion Verde','ong');
+
+INSERT INTO usuarios (external_ref, nombre) VALUES
+ ('USR-0001','Ana Torres'), ('USR-0002','Luis Meneses');
+
+INSERT INTO compromisos (usuario_id, empresa_id, codigo, monto, fecha_vencimiento) VALUES
+ (1,1,'AR-2026-0101', 120000, '2026-06-05'),
+ (1,3,'AR-2026-0102',  89500, '2026-06-12'),
+ (2,2,'AR-2026-0103', 210000, '2026-06-20');
+
